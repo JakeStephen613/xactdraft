@@ -1,0 +1,5 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+mss==9.0.2
+pyautogui==0.9.54
+pillow==10.4.0

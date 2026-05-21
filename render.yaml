@@ -1,0 +1,31 @@
+services:
+  # Express API backend
+  - type: web
+    name: xactdraft-api
+    runtime: node
+    buildCommand: npm install --prefix server
+    startCommand: node server/index.js
+    envVars:
+      - fromGroup: xactdraft
+
+  # Background worker — consumes the Upstash job queue
+  - type: worker
+    name: xactdraft-worker
+    runtime: node
+    buildCommand: npm install --prefix server
+    startCommand: node server/workers/jobProcessor.js
+    envVars:
+      - fromGroup: xactdraft
+
+  # React frontend static site
+  - type: static
+    name: xactdraft-client
+    buildCommand: npm install --prefix client && npm run build --prefix client
+    staticPublishPath: client/dist
+    envVars:
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_API_URL
+        sync: false
