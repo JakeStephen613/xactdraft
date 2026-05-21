@@ -1,27 +1,127 @@
 services:
-  # Express API backend
+  # ── Express API backend ───────────────────────────────────────────────────────
   - type: web
     name: xactdraft-api
     runtime: node
-    buildCommand: npm install --prefix server
+    buildCommand: cd server && npm install
     startCommand: node server/index.js
     envVars:
-      - fromGroup: xactdraft
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: GCP_PROJECT_ID
+        sync: false
+      - key: GCP_REGION
+        sync: false
+      - key: GCP_ZONE
+        sync: false
+      - key: GCP_BUCKET_NAME
+        sync: false
+      - key: XACTIMATE_IMAGE_ID
+        sync: false
+      - key: VM_INSTANCE_TYPE
+        sync: false
+      - key: MAX_CONCURRENT_VMS
+        sync: false
+      - key: XACTIMATE_LICENSE_KEY
+        sync: false
+      - key: XACTIMATE_USERNAME
+        sync: false
+      - key: XACTIMATE_PASSWORD
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DOCUSIGN_INTEGRATION_KEY
+        sync: false
+      - key: DOCUSIGN_SECRET
+        sync: false
+      - key: DOCUSIGN_REDIRECT_URI
+        sync: false
+      - key: DOCUSIGN_AUTH_SERVER
+        sync: false
+      - key: DOCUSIGN_WEBHOOK_SECRET
+        sync: false
+      - key: NOTIFICATION_EMAIL
+        sync: false
+      - key: XACTIMATE_CRED_ENCRYPTION_KEY
+        sync: false
+      - key: CLIENT_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
 
-  # Background worker — consumes the Upstash job queue
+  # ── Background worker — consumes the Redis job queue ─────────────────────────
   - type: worker
     name: xactdraft-worker
     runtime: node
-    buildCommand: npm install --prefix server
-    startCommand: node server/workers/jobProcessor.js
+    buildCommand: cd server && npm install
+    startCommand: node server/worker.js
     envVars:
-      - fromGroup: xactdraft
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: GCP_PROJECT_ID
+        sync: false
+      - key: GCP_REGION
+        sync: false
+      - key: GCP_ZONE
+        sync: false
+      - key: GCP_BUCKET_NAME
+        sync: false
+      - key: XACTIMATE_IMAGE_ID
+        sync: false
+      - key: VM_INSTANCE_TYPE
+        sync: false
+      - key: MAX_CONCURRENT_VMS
+        sync: false
+      - key: XACTIMATE_LICENSE_KEY
+        sync: false
+      - key: XACTIMATE_USERNAME
+        sync: false
+      - key: XACTIMATE_PASSWORD
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DOCUSIGN_INTEGRATION_KEY
+        sync: false
+      - key: DOCUSIGN_SECRET
+        sync: false
+      - key: DOCUSIGN_REDIRECT_URI
+        sync: false
+      - key: DOCUSIGN_AUTH_SERVER
+        sync: false
+      - key: NOTIFICATION_EMAIL
+        sync: false
+      - key: XACTIMATE_CRED_ENCRYPTION_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production
 
-  # React frontend static site
+  # ── React frontend static site ────────────────────────────────────────────────
   - type: static
-    name: xactdraft-client
-    buildCommand: npm install --prefix client && npm run build --prefix client
+    name: xactdraft-web
+    buildCommand: cd client && npm install && npm run build
     staticPublishPath: client/dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
     envVars:
       - key: VITE_SUPABASE_URL
         sync: false

@@ -1,7 +1,7 @@
 'use strict'
 
 const db = require('../db/client')
-const redis = require('../lib/redis')
+const { getRedis } = require('../lib/redis')
 
 const RETRY_KEY = 'jobs:docusign_retry'
 const RETRY_INTERVAL_MS = 10 * 60 * 1000    // 10 minutes
@@ -199,7 +199,7 @@ async function createDocuSignDraft(jobId, pdfBuffer) {
         [fallbackKey, jobId]
       )
       const member = `${jobId}:${Date.now()}`
-      await redis.zadd(RETRY_KEY, Date.now() + RETRY_INTERVAL_MS, member)
+      await getRedis().zadd(RETRY_KEY, Date.now() + RETRY_INTERVAL_MS, member)
     } catch (fallbackErr) {
       console.error(`[docusign] Fallback save failed for job ${jobId}:`, fallbackErr.message)
     }
@@ -212,11 +212,11 @@ async function createDocuSignDraft(jobId, pdfBuffer) {
 
 async function processDocuSignRetries() {
   const now = Date.now()
-  const due = await redis.zrangebyscore(RETRY_KEY, '-inf', now, 'LIMIT', 0, 20)
+  const due = await getRedis().zrangebyscore(RETRY_KEY, '-inf', now, 'LIMIT', 0, 20)
   if (!due.length) return
 
   for (const member of due) {
-    await redis.zrem(RETRY_KEY, member)
+    await getRedis().zrem(RETRY_KEY, member)
 
     const colonIdx = member.indexOf(':')
     const jobId = member.slice(0, colonIdx)
@@ -274,7 +274,7 @@ async function processDocuSignRetries() {
 
     } catch (err) {
       console.error(`[docusign] Retry failed for job ${jobId}:`, err.message)
-      await redis.zadd(RETRY_KEY, now + RETRY_INTERVAL_MS, member)
+      await getRedis().zadd(RETRY_KEY, now + RETRY_INTERVAL_MS, member)
     }
   }
 }

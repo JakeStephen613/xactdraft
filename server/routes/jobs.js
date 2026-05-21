@@ -1,10 +1,13 @@
+'use strict'
+
 const express = require('express')
 const router = express.Router()
 const multer = require('multer')
 const { v4: uuidv4 } = require('uuid')
 
 const db = require('../db/client')
-const { jobSubmissionLimiter, concurrencyLimiter } = require('../middleware/ratelimit')
+const { getRedis } = require('../lib/redis')
+const { jobSubmissionLimiter, concurrencyLimiter, decrementConcurrent } = require('../middleware/ratelimit')
 const { uploadFile } = require('../services/storage')
 const { scanBuffer } = require('../services/scanner')
 const { enqueueJob } = require('../services/queue')
@@ -12,6 +15,7 @@ const { enqueueJob } = require('../services/queue')
 const MAX_FILES = 10
 const MAX_FILE_SIZE = 20 * 1024 * 1024   // 20 MB
 const MAX_TOTAL_SIZE = 100 * 1024 * 1024  // 100 MB
+const JOB_DAILY_LIMIT = 10
 
 const ALLOWED_MIME_TYPES = new Set([
   'image/jpeg', 'image/png',
@@ -29,8 +33,24 @@ const upload = multer({
   }
 })
 
+function draftUrl(envelopeId, accountId) {
+  if (!envelopeId || !accountId) return null
+  return `${process.env.DOCUSIGN_AUTH_SERVER}/documents/${accountId}/drafts/${envelopeId}`
+}
+
+function formatEvent(ev) {
+  const p = ev.payload || {}
+  switch (ev.event_type) {
+    case 'agent_step':
+      return `Agent step — stop reason: ${p.stop_reason || '?'}, blocks: ${p.content_blocks ?? '?'}`
+    case 'attempt_failed':
+      return `Attempt ${p.attempt} failed: ${p.error || 'unknown error'}`
+    default:
+      return `${ev.event_type}: ${Object.keys(p).length ? JSON.stringify(p) : '(no detail)'}`
+  }
+}
+
 // ── POST /api/jobs ────────────────────────────────────────────────────────────
-// Creates a job record in 'uploading' state.
 router.post('/', jobSubmissionLimiter, concurrencyLimiter, async (req, res) => {
   const { address, description } = req.body
   if (!address?.trim()) {
@@ -48,7 +68,6 @@ router.post('/', jobSubmissionLimiter, concurrencyLimiter, async (req, res) => {
 })
 
 // ── POST /api/jobs/:id/files ──────────────────────────────────────────────────
-// Accepts multipart/form-data. Scans, uploads, and queues the job.
 router.post('/:id/files', (req, res, next) => {
   upload.array('files', MAX_FILES)(req, res, (err) => {
     if (err instanceof multer.MulterError) {
@@ -65,7 +84,6 @@ router.post('/:id/files', (req, res, next) => {
 }, async (req, res) => {
   const jobId = req.params.id
 
-  // Verify job belongs to this user and is still in uploading state
   const { rows } = await db.query(
     'SELECT id, status FROM jobs WHERE id = $1 AND user_id = $2',
     [jobId, req.user.id]
@@ -78,7 +96,6 @@ router.post('/:id/files', (req, res, next) => {
   const files = req.files || []
   if (!files.length) return res.status(400).json({ error: 'No files provided' })
 
-  // Total size guard (individual size already enforced by multer)
   const totalSize = files.reduce((sum, f) => sum + f.size, 0)
   if (totalSize > MAX_TOTAL_SIZE) {
     return res.status(400).json({
@@ -90,11 +107,9 @@ router.post('/:id/files', (req, res, next) => {
 
   for (const file of files) {
     const fileId = uuidv4()
-    // Sanitise filename: strip path separators that could escape the GCS key
     const safeName = file.originalname.replace(/[/\\]/g, '_')
     const gcsKey = `jobs/${jobId}/${fileId}-${safeName}`
 
-    // Malware scan
     let scanResult
     try {
       scanResult = await scanBuffer(file.buffer, file.originalname)
@@ -118,10 +133,8 @@ router.post('/:id/files', (req, res, next) => {
       })
     }
 
-    // Upload to GCS
     await uploadFile(file.buffer, gcsKey, file.mimetype)
 
-    // Persist metadata
     await db.query(
       `INSERT INTO files (id, job_id, filename, gcs_key, file_type, size_bytes, malware_clean)
        VALUES ($1,$2,$3,$4,$5,$6,true)`,
@@ -131,13 +144,11 @@ router.post('/:id/files', (req, res, next) => {
     saved.push({ fileId, filename: file.originalname })
   }
 
-  // All files clean and uploaded — transition to queued
   await db.query(`UPDATE jobs SET status = 'queued' WHERE id = $1`, [jobId])
 
   try {
     await enqueueJob(jobId)
   } catch (err) {
-    // Queue full: job stays in 'queued' state in DB; worker will pick it up on next poll
     if (err.status === 429) {
       return res.status(429).json({ error: err.message, retryAfter: err.retryAfter })
     }
@@ -148,21 +159,55 @@ router.post('/:id/files', (req, res, next) => {
 })
 
 // ── GET /api/jobs ─────────────────────────────────────────────────────────────
+// Returns { jobs, usage } — the usage block drives the dashboard meter.
 router.get('/', async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT id, status, address, description, created_at, completed_at
-     FROM jobs WHERE user_id = $1 ORDER BY created_at DESC`,
-    [req.user.id]
-  )
-  res.json(rows)
+  const redis = getRedis()
+  const dayWindow = Math.floor(Date.now() / 86_400_000)
+  const concurrentLimit = req.user.plan === 'enterprise' ? 10 : 3
+
+  const [jobRows, jobsToday, concurrentRaw] = await Promise.all([
+    db.query(
+      `SELECT j.id, j.status, j.address, j.description,
+              j.created_at, j.completed_at, j.error_message,
+              j.docusign_envelope_id, u.docusign_account_id,
+              COUNT(f.id)::int AS file_count
+       FROM jobs j
+       JOIN users u ON u.id = j.user_id
+       LEFT JOIN files f ON f.job_id = j.id
+       WHERE j.user_id = $1
+       GROUP BY j.id, u.docusign_account_id
+       ORDER BY j.created_at DESC`,
+      [req.user.id]
+    ),
+    redis.get(`ratelimit:jobs:${req.user.id}:${dayWindow}`),
+    redis.get(`ratelimit:concurrent:${req.user.id}`)
+  ])
+
+  const jobs = jobRows.rows.map(job => ({
+    ...job,
+    docusign_draft_url: draftUrl(job.docusign_envelope_id, job.docusign_account_id)
+  }))
+
+  res.json({
+    jobs,
+    usage: {
+      jobsToday:       Math.max(0, parseInt(jobsToday || '0', 10)),
+      jobsLimit:       JOB_DAILY_LIMIT,
+      concurrentActive: Math.max(0, parseInt(concurrentRaw || '0', 10)),
+      concurrentLimit
+    }
+  })
 })
 
 // ── GET /api/jobs/:id ─────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   const { rows: [job] } = await db.query(
-    `SELECT id, status, address, description, vm_instance_name,
-            docusign_envelope_id, error_message, created_at, completed_at
-     FROM jobs WHERE id = $1 AND user_id = $2`,
+    `SELECT j.id, j.status, j.address, j.description,
+            j.vm_instance_name, j.docusign_envelope_id, j.error_message,
+            j.created_at, j.completed_at, u.docusign_account_id
+     FROM jobs j
+     JOIN users u ON u.id = j.user_id
+     WHERE j.id = $1 AND j.user_id = $2`,
     [req.params.id, req.user.id]
   )
   if (!job) return res.status(404).json({ error: 'Job not found' })
@@ -173,21 +218,86 @@ router.get('/:id', async (req, res) => {
     [job.id]
   )
 
+  res.json({
+    ...job,
+    docusign_draft_url: draftUrl(job.docusign_envelope_id, job.docusign_account_id),
+    files
+  })
+})
+
+// ── GET /api/jobs/:id/logs ────────────────────────────────────────────────────
+router.get('/:id/logs', async (req, res) => {
+  const { rows: [job] } = await db.query(
+    'SELECT id FROM jobs WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.id]
+  )
+  if (!job) return res.status(404).json({ error: 'Job not found' })
+
   const { rows: events } = await db.query(
     `SELECT event_type, payload, created_at
      FROM job_events WHERE job_id = $1 ORDER BY created_at`,
     [job.id]
   )
 
-  res.json({ ...job, files, events })
+  const logs = events.map(ev => ({
+    timestamp: ev.created_at,
+    message: formatEvent(ev)
+  }))
+
+  res.json(logs)
+})
+
+// ── DELETE /api/jobs/:id ──────────────────────────────────────────────────────
+router.delete('/:id', async (req, res) => {
+  const { rows: [job] } = await db.query(
+    'SELECT id, status, user_id FROM jobs WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.id]
+  )
+  if (!job) return res.status(404).json({ error: 'Job not found' })
+
+  if (!['queued', 'processing'].includes(job.status)) {
+    return res.status(409).json({ error: 'Only queued or processing jobs can be cancelled' })
+  }
+
+  if (job.status === 'processing') {
+    const { tearDownVm } = require('../services/vm')
+    await tearDownVm(job.id).catch(e => console.error('[cancel] teardown error:', e.message))
+    await decrementConcurrent(req.user.id).catch(() => {})
+  }
+
+  await db.query(`UPDATE jobs SET status = 'cancelled' WHERE id = $1`, [job.id])
+
+  res.json({ success: true })
+})
+
+// ── POST /api/jobs/:id/retry ──────────────────────────────────────────────────
+router.post('/:id/retry', async (req, res) => {
+  const { rows: [job] } = await db.query(
+    'SELECT id, status FROM jobs WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.id]
+  )
+  if (!job) return res.status(404).json({ error: 'Job not found' })
+  if (job.status !== 'failed') {
+    return res.status(409).json({ error: 'Only failed jobs can be retried' })
+  }
+
+  await db.query(
+    `UPDATE jobs SET status = 'queued', error_message = NULL,
+                     vm_instance_name = NULL, vm_ip = NULL
+     WHERE id = $1`,
+    [job.id]
+  )
+
+  await enqueueJob(job.id)
+
+  res.json({ success: true, status: 'queued' })
 })
 
 // ── PATCH /api/jobs/:id ───────────────────────────────────────────────────────
 router.patch('/:id', async (req, res) => {
   const { status } = req.body
-  const allowed = ['complete']
-  if (!allowed.includes(status)) {
-    return res.status(400).json({ error: `Only these status transitions are allowed from the client: ${allowed.join(', ')}` })
+  if (status !== 'complete') {
+    return res.status(400).json({ error: 'Only status=complete is allowed from the client' })
   }
 
   const { rows: [job] } = await db.query(
