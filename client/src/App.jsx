@@ -1,15 +1,23 @@
 import { useState, useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { supabase } from './lib/supabase.js'
+import Sidebar from './components/Sidebar.jsx'
 import Login from './pages/Login.jsx'
 import Dashboard from './pages/Dashboard.jsx'
 import Upload from './pages/Upload.jsx'
 import JobDetail from './pages/JobDetail.jsx'
 
-function ProtectedRoute({ session, children }) {
-  if (session === undefined) return null  // still loading
+function AuthLayout({ session, children }) {
+  if (session === undefined) return null
   if (!session) return <Navigate to="/login" replace />
-  return children
+  return (
+    <div style={{ display: 'flex', minHeight: '100vh' }}>
+      <Sidebar />
+      <main style={{ marginLeft: 220, flex: 1, minWidth: 0 }}>
+        {children}
+      </main>
+    </div>
+  )
 }
 
 export default function App() {
@@ -19,11 +27,9 @@ export default function App() {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session ?? null)
     })
-
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_, session) => {
       setSession(session ?? null)
     })
-
     return () => subscription.unsubscribe()
   }, [])
 
@@ -36,15 +42,15 @@ export default function App() {
         />
         <Route
           path="/dashboard"
-          element={<ProtectedRoute session={session}><Dashboard /></ProtectedRoute>}
+          element={<AuthLayout session={session}><Dashboard /></AuthLayout>}
         />
         <Route
           path="/upload"
-          element={<ProtectedRoute session={session}><Upload /></ProtectedRoute>}
+          element={<AuthLayout session={session}><Upload /></AuthLayout>}
         />
         <Route
           path="/jobs/:id"
-          element={<ProtectedRoute session={session}><JobDetail /></ProtectedRoute>}
+          element={<AuthLayout session={session}><JobDetail /></AuthLayout>}
         />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>

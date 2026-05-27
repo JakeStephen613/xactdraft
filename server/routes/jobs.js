@@ -33,11 +33,6 @@ const upload = multer({
   }
 })
 
-function draftUrl(envelopeId, accountId) {
-  if (!envelopeId || !accountId) return null
-  return `${process.env.DOCUSIGN_AUTH_SERVER}/documents/${accountId}/drafts/${envelopeId}`
-}
-
 function formatEvent(ev) {
   const p = ev.payload || {}
   switch (ev.event_type) {
@@ -169,13 +164,12 @@ router.get('/', async (req, res) => {
     db.query(
       `SELECT j.id, j.status, j.address, j.description,
               j.created_at, j.completed_at, j.error_message,
-              j.docusign_envelope_id, u.docusign_account_id,
+              j.estimate_file_id,
               COUNT(f.id)::int AS file_count
        FROM jobs j
-       JOIN users u ON u.id = j.user_id
-       LEFT JOIN files f ON f.job_id = j.id
+       LEFT JOIN files f ON f.job_id = j.id AND f.filename != 'estimate.pdf'
        WHERE j.user_id = $1
-       GROUP BY j.id, u.docusign_account_id
+       GROUP BY j.id
        ORDER BY j.created_at DESC`,
       [req.user.id]
     ),
@@ -183,13 +177,8 @@ router.get('/', async (req, res) => {
     redis.get(`ratelimit:concurrent:${req.user.id}`)
   ])
 
-  const jobs = jobRows.rows.map(job => ({
-    ...job,
-    docusign_draft_url: draftUrl(job.docusign_envelope_id, job.docusign_account_id)
-  }))
-
   res.json({
-    jobs,
+    jobs: jobRows.rows,
     usage: {
       jobsToday:       Math.max(0, parseInt(jobsToday || '0', 10)),
       jobsLimit:       JOB_DAILY_LIMIT,
@@ -202,27 +191,21 @@ router.get('/', async (req, res) => {
 // ── GET /api/jobs/:id ─────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   const { rows: [job] } = await db.query(
-    `SELECT j.id, j.status, j.address, j.description,
-            j.vm_instance_name, j.docusign_envelope_id, j.error_message,
-            j.created_at, j.completed_at, u.docusign_account_id
-     FROM jobs j
-     JOIN users u ON u.id = j.user_id
-     WHERE j.id = $1 AND j.user_id = $2`,
+    `SELECT id, status, address, description, vm_instance_name, error_message,
+            estimate_file_id, created_at, completed_at
+     FROM jobs
+     WHERE id = $1 AND user_id = $2`,
     [req.params.id, req.user.id]
   )
   if (!job) return res.status(404).json({ error: 'Job not found' })
 
   const { rows: files } = await db.query(
     `SELECT id, filename, file_type, size_bytes, malware_clean, created_at
-     FROM files WHERE job_id = $1 ORDER BY created_at`,
+     FROM files WHERE job_id = $1 AND filename != 'estimate.pdf' ORDER BY created_at`,
     [job.id]
   )
 
-  res.json({
-    ...job,
-    docusign_draft_url: draftUrl(job.docusign_envelope_id, job.docusign_account_id),
-    files
-  })
+  res.json({ ...job, files })
 })
 
 // ── GET /api/jobs/:id/logs ────────────────────────────────────────────────────

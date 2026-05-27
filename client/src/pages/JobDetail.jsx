@@ -3,246 +3,507 @@ import { useParams, Link, useNavigate } from 'react-router-dom'
 import api from '../lib/api.js'
 import StatusBadge from '../components/StatusBadge.jsx'
 
+function DownloadButton({ fileId }) {
+  const [loading, setLoading] = useState(false)
+
+  async function handleDownload() {
+    setLoading(true)
+    try {
+      const { data } = await api.get(`/files/${fileId}/download`)
+      window.open(data.url, '_blank', 'noopener')
+    } catch {
+      alert('Download failed — please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <button onClick={handleDownload} disabled={loading} style={{
+      display: 'inline-flex', alignItems: 'center', height: 36, padding: '0 16px',
+      background: '#111827', color: '#fff', border: 'none', borderRadius: 6,
+      cursor: loading ? 'default' : 'pointer', fontSize: 13, fontWeight: 500,
+      flexShrink: 0, opacity: loading ? 0.7 : 1,
+    }}>
+      {loading ? 'Getting link…' : 'Download estimate'}
+    </button>
+  )
+}
+
 const ACTIVE_STATUSES = new Set(['uploading', 'queued', 'processing'])
 
 function formatBytes(b) {
-  if (b < 1024) return `${b} B`
+  if (b < 1024)      return `${b} B`
   if (b < 1024 ** 2) return `${(b / 1024).toFixed(1)} KB`
   return `${(b / 1024 ** 2).toFixed(1)} MB`
 }
 
-function fileIcon(mimeType) {
-  if (!mimeType) return '📄'
-  if (mimeType.startsWith('image/')) return '🖼'
-  if (mimeType === 'application/pdf') return '📋'
-  return '📄'
+function fileExt(mimeType) {
+  if (!mimeType) return 'file'
+  if (mimeType.startsWith('image/')) return 'img'
+  if (mimeType === 'application/pdf') return 'pdf'
+  return 'txt'
 }
 
 function formatTime(iso) {
   if (!iso) return ''
-  return new Date(iso).toLocaleString()
+  return new Date(iso).toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  })
 }
 
 export default function JobDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const [job, setJob]   = useState(null)
-  const [logs, setLogs] = useState([])
+  const [job, setJob]           = useState(null)
+  const [logs, setLogs]         = useState([])
   const [loading, setLoading]   = useState(true)
   const [retrying, setRetrying] = useState(false)
   const [error, setError]       = useState(null)
   const logEndRef = useRef(null)
-  const jobRef = useRef(null)
+  const jobRef    = useRef(null)
 
   const fetchJob = useCallback(async () => {
     try {
       const { data } = await api.get(`/jobs/${id}`)
-      setJob(data)
-      jobRef.current = data
+      setJob(data); jobRef.current = data
     } catch (err) {
-      if (err.response?.status === 404) setError('Job not found')
-      else setError(err.response?.data?.error || 'Failed to load job')
+      setError(err.response?.status === 404 ? 'Job not found' : (err.response?.data?.error || 'Failed to load job'))
     }
   }, [id])
 
   const fetchLogs = useCallback(async () => {
-    try {
-      const { data } = await api.get(`/jobs/${id}/logs`)
-      setLogs(data)
-    } catch {
-      // non-fatal
-    }
+    try { const { data } = await api.get(`/jobs/${id}/logs`); setLogs(data) } catch {}
   }, [id])
 
   useEffect(() => {
     Promise.all([fetchJob(), fetchLogs()]).finally(() => setLoading(false))
-
-    const id_ = setInterval(() => {
-      if (ACTIVE_STATUSES.has(jobRef.current?.status)) {
-        fetchJob()
-        fetchLogs()
-      }
+    const timer = setInterval(() => {
+      if (ACTIVE_STATUSES.has(jobRef.current?.status)) { fetchJob(); fetchLogs() }
     }, 10_000)
-
-    return () => clearInterval(id_)
+    return () => clearInterval(timer)
   }, [fetchJob, fetchLogs])
 
-  // Auto-scroll logs to bottom when new entries arrive
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs.length])
 
   async function handleRetry() {
     setRetrying(true)
-    try {
-      await api.post(`/jobs/${id}/retry`)
-      await fetchJob()
-    } catch (err) {
-      alert(err.response?.data?.error || 'Retry failed')
-    } finally {
-      setRetrying(false)
-    }
+    try { await api.post(`/jobs/${id}/retry`); await fetchJob() }
+    catch (err) { alert(err.response?.data?.error || 'Retry failed') }
+    finally { setRetrying(false) }
   }
 
   async function handleCancel() {
     if (!window.confirm('Cancel this job?')) return
-    try {
-      await api.delete(`/jobs/${id}`)
-      navigate('/dashboard')
-    } catch (err) {
-      alert(err.response?.data?.error || 'Could not cancel job')
-    }
+    try { await api.delete(`/jobs/${id}`); navigate('/dashboard') }
+    catch (err) { alert(err.response?.data?.error || 'Could not cancel job') }
   }
 
-  if (loading) return <div style={s.page}><p style={s.dim}>Loading…</p></div>
-  if (error)   return <div style={s.page}><p style={s.err}>{error}</p><Link to="/dashboard" style={s.back}>← Dashboard</Link></div>
-  if (!job)    return null
+  if (loading) return (
+    <div style={s.page}><p style={s.dim}>Loading…</p></div>
+  )
+  if (error) return (
+    <div style={s.page}>
+      <Link to="/dashboard" style={s.back}>← Jobs</Link>
+      <p style={s.errText}>{error}</p>
+    </div>
+  )
+  if (!job) return null
 
-  const canReview = (job.status === 'review_ready' || job.status === 'complete') && job.docusign_draft_url
-  const isFailed  = job.status === 'failed'
-  const isActive  = ACTIVE_STATUSES.has(job.status)
+  const hasEstimate = (job.status === 'review_ready' || job.status === 'complete') && job.estimate_file_id
+  const isFailed    = job.status === 'failed'
+  const isActive    = ACTIVE_STATUSES.has(job.status)
 
   return (
     <div style={s.page}>
-      <div style={s.container}>
 
-        {/* Back link */}
-        <Link to="/dashboard" style={s.back}>← Dashboard</Link>
+      <Link to="/dashboard" style={s.back}>← Jobs</Link>
 
-        {/* Job header */}
-        <div style={s.card}>
-          <div style={s.headerRow}>
-            <div>
-              <h1 style={s.address}>{job.address || '(no address)'}</h1>
-              {job.description && <p style={s.desc}>{job.description}</p>}
-            </div>
-            <StatusBadge status={job.status} />
-          </div>
+      {/* Page header */}
+      <div style={s.pageHeader}>
+        <div style={s.titleRow}>
+          <h1 style={s.address}>{job.address || '(no address)'}</h1>
+          <StatusBadge status={job.status} />
+        </div>
+        <div style={s.metaRow}>
+          <span style={s.metaItem}>Created {formatTime(job.created_at)}</span>
+          {job.completed_at && (
+            <>
+              <span style={s.metaDot} />
+              <span style={s.metaItem}>Completed {formatTime(job.completed_at)}</span>
+            </>
+          )}
+        </div>
+        {job.description && <p style={s.desc}>{job.description}</p>}
+      </div>
 
-          <div style={s.meta}>
-            <span style={s.metaItem}>Created: {formatTime(job.created_at)}</span>
-            {job.completed_at && (
-              <span style={s.metaItem}>Completed: {formatTime(job.completed_at)}</span>
+      {/* Action panel */}
+      {(hasEstimate || isFailed || isActive) && (
+        <div style={s.actionPanel}>
+          <div style={s.actionPanelInner}>
+            {hasEstimate && (
+              <div style={s.actionItem}>
+                <div>
+                  <p style={s.actionTitle}>Estimate ready</p>
+                  <p style={s.actionSub}>Download the completed Xactimate estimate PDF.</p>
+                </div>
+                <DownloadButton fileId={job.estimate_file_id} />
+              </div>
+            )}
+            {isFailed && (
+              <div style={s.actionItem}>
+                <div>
+                  <p style={s.actionTitle}>Job failed</p>
+                  <p style={s.actionSub}>Both processing attempts were exhausted.</p>
+                </div>
+                <button onClick={handleRetry} disabled={retrying} style={s.secondaryBtn}>
+                  {retrying ? 'Retrying…' : 'Retry job'}
+                </button>
+              </div>
+            )}
+            {isActive && (
+              <div style={s.actionItem}>
+                <div>
+                  <p style={s.actionTitle}>Job in progress</p>
+                  <p style={s.actionSub}>Processing will continue in the background.</p>
+                </div>
+                <button onClick={handleCancel} style={s.cancelBtn}>Cancel job</button>
+              </div>
             )}
           </div>
+        </div>
+      )}
 
-          {/* Primary action */}
-          {canReview && (
-            <a href={job.docusign_draft_url} target="_blank" rel="noreferrer" style={s.reviewBtn}>
-              Review in DocuSign →
-            </a>
-          )}
+      {/* Error detail */}
+      {isFailed && job.error_message && (
+        <div style={s.errorCard}>
+          <p style={s.errorLabel}>Error detail</p>
+          <p style={s.errorText}>{job.error_message}</p>
+        </div>
+      )}
 
-          {isFailed && (
-            <div style={s.failedBox}>
-              <p style={s.failedMsg}>{job.error_message || 'Processing failed.'}</p>
-              <button onClick={handleRetry} disabled={retrying} style={s.retryBtn}>
-                {retrying ? 'Retrying…' : 'Retry this job'}
-              </button>
+      {/* Files */}
+      {job.files?.length > 0 && (
+        <div style={s.panel}>
+          <div style={s.panelHeader}>
+            <p style={s.panelTitle}>Files</p>
+            <span style={s.panelCount}>{job.files.length}</span>
+          </div>
+          <div style={s.fileList}>
+            {job.files.map((f, i) => (
+              <div
+                key={f.id}
+                style={{ ...s.fileRow, borderBottom: i < job.files.length - 1 ? '1px solid #f3f4f6' : 'none' }}
+              >
+                <span style={s.fileExt}>{fileExt(f.file_type)}</span>
+                <span style={s.fileName}>{f.filename}</span>
+                <div style={s.fileMeta}>
+                  {f.size_bytes ? <span style={s.fileSize}>{formatBytes(f.size_bytes)}</span> : null}
+                  <span style={{
+                    ...s.scanBadge,
+                    color: f.malware_clean === true ? '#15803d' : f.malware_clean === false ? '#b91c1c' : '#9ca3af',
+                    background: f.malware_clean === true ? '#f0fdf4' : f.malware_clean === false ? '#fef2f2' : '#f9fafb',
+                  }}>
+                    {f.malware_clean === true ? 'Clean' : f.malware_clean === false ? 'Flagged' : 'Scanning…'}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Processing log */}
+      <div style={s.panel}>
+        <div style={s.panelHeader}>
+          <p style={s.panelTitle}>Processing log</p>
+          {isActive && (
+            <div style={s.liveIndicator}>
+              <span className="pulse-dot" style={s.liveDot} />
+              <span style={s.liveText}>Live</span>
             </div>
           )}
-
-          {isActive && (
-            <button onClick={handleCancel} style={s.cancelBtn}>Cancel job</button>
-          )}
         </div>
-
-        {/* Files */}
-        {job.files?.length > 0 && (
-          <div style={s.card}>
-            <h2 style={s.sectionTitle}>Files ({job.files.length})</h2>
-            <ul style={s.fileList}>
-              {job.files.map(f => (
-                <li key={f.id} style={s.fileRow}>
-                  <span style={s.fileIcon}>{fileIcon(f.file_type)}</span>
-                  <span style={s.fileName}>{f.filename}</span>
-                  <span style={s.fileSize}>{f.size_bytes ? formatBytes(f.size_bytes) : ''}</span>
-                  <span style={{ ...s.scanBadge, color: f.malware_clean ? '#16a34a' : '#dc2626' }}>
-                    {f.malware_clean === true ? 'Clean' : f.malware_clean === false ? 'Flagged' : 'Pending'}
-                  </span>
-                </li>
-              ))}
-            </ul>
+        {logs.length === 0 ? (
+          <div style={s.logEmpty}>
+            <p style={s.dim}>No activity yet.</p>
+          </div>
+        ) : (
+          <div style={s.logBox}>
+            {logs.map((entry, i) => (
+              <div key={i} style={s.logRow}>
+                <span style={s.logTime}>
+                  {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </span>
+                <span style={s.logMsg}>{entry.message}</span>
+              </div>
+            ))}
+            <div ref={logEndRef} />
           </div>
         )}
-
-        {/* Processing log */}
-        <div style={s.card}>
-          <h2 style={s.sectionTitle}>Processing Log</h2>
-          {logs.length === 0 ? (
-            <p style={s.dim}>No log entries yet.</p>
-          ) : (
-            <div style={s.logBox}>
-              {logs.map((entry, i) => (
-                <div key={i} style={s.logRow}>
-                  <span style={s.logTime}>{new Date(entry.timestamp).toLocaleTimeString()}</span>
-                  <span style={s.logMsg}>{entry.message}</span>
-                </div>
-              ))}
-              <div ref={logEndRef} />
-            </div>
-          )}
-        </div>
-
       </div>
+
     </div>
   )
 }
 
 const s = {
-  page: { minHeight: '100vh', background: '#f3f4f6', padding: '32px 16px', fontFamily: 'system-ui, sans-serif' },
-  container: { maxWidth: 720, margin: '0 auto' },
-  back: { display: 'inline-block', color: '#6b7280', textDecoration: 'none', fontSize: 14, marginBottom: 20 },
-  card: { background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: '24px', marginBottom: 16 },
-  headerRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 12 },
-  address: { margin: 0, fontSize: 22, fontWeight: 700 },
-  desc: { margin: '6px 0 0', fontSize: 14, color: '#6b7280' },
-  meta: { display: 'flex', gap: 20, flexWrap: 'wrap', marginBottom: 16 },
-  metaItem: { fontSize: 13, color: '#6b7280' },
-  reviewBtn: {
-    display: 'inline-block',
-    padding: '10px 20px',
-    background: '#22c55e',
-    color: '#fff',
-    borderRadius: 6,
-    textDecoration: 'none',
-    fontWeight: 700,
-    fontSize: 15
+  page: {
+    padding: '36px 48px',
+    maxWidth: 800,
   },
-  failedBox: { background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: 16 },
-  failedMsg: { margin: '0 0 12px', fontSize: 14, color: '#b91c1c' },
-  retryBtn: {
-    padding: '8px 18px',
-    background: '#dc2626',
-    color: '#fff',
-    border: 'none',
+  back: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    fontSize: 13,
+    color: '#6b7280',
+    textDecoration: 'none',
+    marginBottom: 20,
+    gap: 4,
+  },
+  pageHeader: {
+    marginBottom: 24,
+  },
+  titleRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    flexWrap: 'wrap',
+    marginBottom: 8,
+  },
+  address: {
+    fontSize: 22,
+    fontWeight: 600,
+    color: '#111827',
+    letterSpacing: '-0.02em',
+    margin: 0,
+    lineHeight: 1.2,
+  },
+  metaRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
+  metaItem: {
+    fontSize: 12,
+    color: '#9ca3af',
+  },
+  metaDot: {
+    display: 'inline-block',
+    width: 3,
+    height: 3,
+    borderRadius: '50%',
+    background: '#d1d5db',
+  },
+  desc: {
+    fontSize: 14,
+    color: '#6b7280',
+    marginTop: 4,
+    lineHeight: 1.5,
+  },
+  actionPanel: {
+    background: '#fff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 10,
+    boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+  actionPanelInner: {
+    padding: '18px 22px',
+  },
+  actionItem: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 20,
+    flexWrap: 'wrap',
+  },
+  actionTitle: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: '#111827',
+    marginBottom: 2,
+  },
+  actionSub: {
+    fontSize: 13,
+    color: '#6b7280',
+  },
+  secondaryBtn: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    height: 36,
+    padding: '0 16px',
+    background: '#fff',
+    color: '#374151',
+    border: '1px solid #e5e7eb',
     borderRadius: 6,
     cursor: 'pointer',
-    fontWeight: 600,
-    fontSize: 14
+    fontSize: 13,
+    fontWeight: 500,
+    flexShrink: 0,
   },
   cancelBtn: {
-    marginTop: 12,
-    padding: '8px 18px',
-    background: '#fee2e2',
-    color: '#dc2626',
-    border: '1px solid #fca5a5',
+    display: 'inline-flex',
+    alignItems: 'center',
+    height: 36,
+    padding: '0 16px',
+    background: '#fff',
+    color: '#6b7280',
+    border: '1px solid #e5e7eb',
     borderRadius: 6,
     cursor: 'pointer',
-    fontSize: 14,
-    fontWeight: 600
+    fontSize: 13,
+    fontWeight: 500,
+    flexShrink: 0,
   },
-  sectionTitle: { margin: '0 0 14px', fontSize: 16, fontWeight: 600 },
-  fileList: { listStyle: 'none', margin: 0, padding: 0 },
-  fileRow: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid #f3f4f6' },
-  fileIcon: { fontSize: 18, flexShrink: 0 },
-  fileName: { flex: 1, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  fileSize: { fontSize: 12, color: '#9ca3af', whiteSpace: 'nowrap' },
-  scanBadge: { fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap' },
-  logBox: { background: '#0f172a', borderRadius: 6, padding: '16px', maxHeight: 360, overflowY: 'auto' },
-  logRow: { display: 'flex', gap: 12, marginBottom: 8, fontSize: 13, lineHeight: 1.5 },
-  logTime: { color: '#64748b', whiteSpace: 'nowrap', flexShrink: 0 },
-  logMsg: { color: '#e2e8f0', wordBreak: 'break-word' },
-  dim: { color: '#9ca3af', fontSize: 14, margin: 0 },
-  err: { color: '#dc2626', fontSize: 14 }
+  errorCard: {
+    padding: '14px 18px',
+    background: '#fef2f2',
+    border: '1px solid #fecaca',
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  errorLabel: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#b91c1c',
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+    marginBottom: 4,
+  },
+  errorText: {
+    fontSize: 13,
+    color: '#991b1b',
+    lineHeight: 1.5,
+  },
+  panel: {
+    background: '#fff',
+    border: '1px solid #e5e7eb',
+    borderRadius: 10,
+    boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+    marginBottom: 16,
+    overflow: 'hidden',
+  },
+  panelHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '14px 20px',
+    borderBottom: '1px solid #f3f4f6',
+  },
+  panelTitle: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: '#374151',
+    textTransform: 'uppercase',
+    letterSpacing: '0.06em',
+    flex: 1,
+  },
+  panelCount: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#9ca3af',
+    background: '#f3f4f6',
+    padding: '1px 7px',
+    borderRadius: 99,
+  },
+  liveIndicator: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+  },
+  liveDot: {
+    display: 'inline-block',
+    width: 6,
+    height: 6,
+    borderRadius: '50%',
+    background: '#f59e0b',
+    flexShrink: 0,
+  },
+  liveText: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#b45309',
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+  },
+  fileList: {
+    background: '#fff',
+  },
+  fileRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 20px',
+  },
+  fileExt: {
+    fontSize: 10,
+    fontWeight: 600,
+    color: '#6b7280',
+    background: '#f3f4f6',
+    borderRadius: 4,
+    padding: '2px 5px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+    flexShrink: 0,
+  },
+  fileName: {
+    flex: 1,
+    fontSize: 13,
+    color: '#374151',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  fileMeta: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    flexShrink: 0,
+  },
+  fileSize: {
+    fontSize: 12,
+    color: '#9ca3af',
+  },
+  scanBadge: {
+    fontSize: 11,
+    fontWeight: 500,
+    padding: '2px 7px',
+    borderRadius: 99,
+  },
+  logEmpty: {
+    padding: '20px',
+  },
+  logBox: {
+    background: '#0d1117',
+    padding: '14px 18px',
+    maxHeight: 380,
+    overflowY: 'auto',
+    fontFamily: "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace",
+  },
+  logRow: {
+    display: 'flex',
+    gap: 14,
+    marginBottom: 5,
+    fontSize: 12,
+    lineHeight: 1.6,
+  },
+  logTime: {
+    color: '#6e7681',
+    whiteSpace: 'nowrap',
+    flexShrink: 0,
+    letterSpacing: '0.02em',
+  },
+  logMsg: {
+    color: '#c9d1d9',
+    wordBreak: 'break-word',
+  },
+  dim:     { fontSize: 14, color: '#9ca3af' },
+  errText: { fontSize: 14, color: '#b91c1c' },
 }

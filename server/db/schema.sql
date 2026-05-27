@@ -4,16 +4,11 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ── User profiles ────────────────────────────────────────────────────────────
--- Extends Supabase Auth (auth.users). Created automatically on first sign-in
--- via the handle_new_user trigger below.
 CREATE TABLE public.users (
   id                              uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   email                           text UNIQUE NOT NULL,
   plan                            text NOT NULL DEFAULT 'basic',
   xactimate_credentials_encrypted text,        -- AES-256 encrypted; never store plaintext
-  docusign_access_token           text,
-  docusign_refresh_token          text,
-  docusign_account_id             text,
   created_at                      timestamptz NOT NULL DEFAULT now()
 );
 
@@ -33,20 +28,19 @@ CREATE TRIGGER on_auth_user_created
 
 -- ── Jobs ─────────────────────────────────────────────────────────────────────
 CREATE TABLE public.jobs (
-  id                       uuid        PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id                  uuid        NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  status                   text        NOT NULL DEFAULT 'uploading',
-  address                  text,
-  description              text,
-  vm_instance_name         text,
-  vm_ip                    text,        -- internal GCP IP while VM is active
-  retry_count              integer     NOT NULL DEFAULT 0,
-  docusign_envelope_id     text,
-  docusign_fallback_pdf_path text,     -- GCS path used when DocuSign API is down
-  error_message            text,
-  created_at               timestamptz NOT NULL DEFAULT now(),
-  updated_at               timestamptz NOT NULL DEFAULT now(),
-  completed_at             timestamptz
+  id               uuid        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id          uuid        NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  status           text        NOT NULL DEFAULT 'uploading',
+  address          text,
+  description      text,
+  vm_instance_name text,
+  vm_ip            text,
+  retry_count      integer     NOT NULL DEFAULT 0,
+  estimate_file_id uuid,       -- set when agent uploads estimate.pdf; references files(id)
+  error_message    text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  completed_at     timestamptz
 );
 
 -- Auto-update updated_at on every jobs row change
@@ -67,7 +61,7 @@ CREATE TABLE public.files (
   id            uuid        PRIMARY KEY DEFAULT uuid_generate_v4(),
   job_id        uuid        NOT NULL REFERENCES public.jobs(id) ON DELETE CASCADE,
   filename      text        NOT NULL,
-  gcs_key       text        NOT NULL,   -- object path in GCP Cloud Storage
+  gcs_key       text        NOT NULL,
   file_type     text,
   size_bytes    integer,
   malware_clean boolean,               -- null = scan pending, true = clean, false = infected
@@ -98,6 +92,12 @@ CREATE POLICY "users_own_job_events" ON public.job_events FOR ALL USING (
   job_id IN (SELECT id FROM public.jobs WHERE user_id = auth.uid())
 );
 
--- ── Migrations: run these if you applied the schema before these columns were added ──
+-- ── Migrations: run these against an existing Supabase instance ──────────────
+-- ALTER TABLE public.users DROP COLUMN IF EXISTS docusign_access_token;
+-- ALTER TABLE public.users DROP COLUMN IF EXISTS docusign_refresh_token;
+-- ALTER TABLE public.users DROP COLUMN IF EXISTS docusign_account_id;
+-- ALTER TABLE public.users DROP COLUMN IF EXISTS docusign_base_uri;
+-- ALTER TABLE public.jobs  DROP COLUMN IF EXISTS docusign_envelope_id;
+-- ALTER TABLE public.jobs  DROP COLUMN IF EXISTS docusign_fallback_pdf_path;
+-- ALTER TABLE public.jobs  ADD COLUMN IF NOT EXISTS estimate_file_id uuid;
 -- ALTER TABLE public.jobs  ADD COLUMN IF NOT EXISTS vm_ip text;
--- ALTER TABLE public.users ADD COLUMN IF NOT EXISTS docusign_base_uri text;

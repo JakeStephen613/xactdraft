@@ -7,8 +7,7 @@ const REQUIRED_ENV = [
   'ANTHROPIC_API_KEY',
   'GCP_PROJECT_ID', 'GCP_BUCKET_NAME', 'GCP_ZONE', 'VM_INSTANCE_TYPE',
   'XACTIMATE_IMAGE_ID', 'XACTIMATE_LICENSE_KEY', 'XACTIMATE_USERNAME', 'XACTIMATE_PASSWORD',
-  'DOCUSIGN_INTEGRATION_KEY', 'DOCUSIGN_SECRET', 'DOCUSIGN_REDIRECT_URI', 'DOCUSIGN_AUTH_SERVER',
-  'NOTIFICATION_EMAIL', 'GOOGLE_APPLICATION_CREDENTIALS'
+  'GMAIL_USER', 'GMAIL_APP_PASSWORD'
 ]
 
 const missing = REQUIRED_ENV.filter(v => !process.env[v])
@@ -27,11 +26,9 @@ const { requestLimiter } = require('./middleware/ratelimit')
 const authRoutes = require('./routes/auth')
 const jobRoutes = require('./routes/jobs')
 const fileRoutes = require('./routes/files')
-const webhookRoutes = require('./routes/webhooks')
 const { cleanupOrphanedVms } = require('./cron/orphanedVmCleanup')
 const { ensureLifecyclePolicy } = require('./services/storage')
 const { ensureFirewallRule } = require('./services/vm')
-const { processDocuSignRetries } = require('./services/docusign')
 const { getQueueDepth } = require('./services/queue')
 const { getRedis } = require('./lib/redis')
 const db = require('./db/client')
@@ -40,10 +37,6 @@ const app = express()
 const PORT = process.env.PORT || 3000
 
 app.use(cors())
-
-// Webhook routes BEFORE express.json() so express.raw() can read the raw body for HMAC
-app.use('/api/webhooks', webhookRoutes)
-
 app.use(express.json())
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -61,8 +54,6 @@ app.get('/health', async (_req, res) => {
   })
 })
 
-// Auth routes: individual handlers apply authenticate where needed
-// (DocuSign callback is unauthenticated — can't put authenticate globally here)
 app.use('/api/auth', authRoutes)
 
 // All other API routes require a valid session + per-user request rate limit
@@ -71,12 +62,6 @@ app.use('/api/files', authenticate, requestLimiter, fileRoutes)
 
 // ── Cron jobs ─────────────────────────────────────────────────────────────────
 cron.schedule('0 * * * *', cleanupOrphanedVms)
-
-cron.schedule('*/5 * * * *', () =>
-  processDocuSignRetries().catch(err =>
-    console.error('[cron] DocuSign retry error:', err.message)
-  )
-)
 
 // ── One-time GCP setup on startup (idempotent) ────────────────────────────────
 ensureLifecyclePolicy().catch(err =>

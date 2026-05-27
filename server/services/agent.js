@@ -1,10 +1,12 @@
 'use strict'
 
+const { v4: uuidv4 } = require('uuid')
 const axios = require('axios')
 const Anthropic = require('@anthropic-ai/sdk')
 const db = require('../db/client')
-const { downloadFile } = require('./storage')
+const { uploadFile, downloadFile } = require('./storage')
 const { spinUpVm, tearDownVm } = require('./vm')
+const { incrementConcurrent, decrementConcurrent } = require('../middleware/ratelimit')
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const MODEL        = 'claude-sonnet-4-6'
@@ -18,6 +20,63 @@ const MAX_ATTEMPTS = 2
 
 const DISPLAY_WIDTH  = 1920
 const DISPLAY_HEIGHT = 1080
+
+// ── Context compression ───────────────────────────────────────────────────────
+const MAX_CONTEXT_TOKENS = 200_000
+const COMPRESS_AT        = Math.floor(MAX_CONTEXT_TOKENS * 0.40)  // compress at 80k tokens
+const SCREENSHOT_TOKENS  = 2800   // rough estimate per 1920×1080 PNG
+const KEEP_RECENT        = 8      // how many recent messages to retain
+
+function estimateTokens(messages) {
+  let tokens = 0
+  for (const msg of messages) {
+    for (const block of (Array.isArray(msg.content) ? msg.content : [])) {
+      if (block.type === 'text') {
+        tokens += Math.ceil((block.text || '').length / 4)
+      } else if (block.type === 'image') {
+        tokens += SCREENSHOT_TOKENS
+      } else if (block.type === 'tool_use') {
+        tokens += 50 + Math.ceil(JSON.stringify(block.input || {}).length / 4)
+      } else if (block.type === 'tool_result') {
+        for (const c of (block.content || [])) {
+          if (c.type === 'image') tokens += SCREENSHOT_TOKENS
+          else if (c.type === 'text') tokens += Math.ceil((c.text || '').length / 4)
+        }
+      }
+    }
+  }
+  return tokens
+}
+
+// Trims old messages when context exceeds 40% of the context window.
+// Keeps the initial user message (files + first screenshot) and the most recent turns.
+// The alternating user/assistant pattern is preserved by starting the tail at an odd index.
+function maybeCompress(messages) {
+  if (messages.length <= KEEP_RECENT + 1) return messages
+  const before = estimateTokens(messages)
+  if (before < COMPRESS_AT) return messages
+
+  // Tail must begin at an assistant message (odd index) to stay after messages[0] (user)
+  let tailStart = messages.length - KEEP_RECENT
+  if (tailStart % 2 === 0) tailStart++
+
+  const droppedCount = tailStart - 1
+  const tail = messages.slice(tailStart)
+  const initial = {
+    ...messages[0],
+    content: [
+      ...messages[0].content,
+      {
+        type: 'text',
+        text: `\n[Context trimmed: ${droppedCount} earlier step(s) removed to stay within the context window. Continue the estimate from your current position — the current screen state is in the most recent tool result.]`
+      }
+    ]
+  }
+
+  const after = estimateTokens([initial, ...tail])
+  console.log(`[agent] Context compressed — dropped ${droppedCount} messages (~${before} → ~${after} est. tokens)`)
+  return [initial, ...tail]
+}
 
 const SYSTEM_PROMPT =
   'You are an expert Xactimate estimator operating Xactimate on a Windows computer. ' +
@@ -111,7 +170,7 @@ async function buildFileBlocks(files) {
 async function runAgentOnVm(jobId, vmIp, fileBlocks, startTime) {
   const screenshot0 = await takeScreenshot(vmIp)
 
-  const messages = [{
+  let messages = [{
     role: 'user',
     content: [
       ...fileBlocks,
@@ -124,6 +183,9 @@ async function runAgentOnVm(jobId, vmIp, fileBlocks, startTime) {
     if (Date.now() - startTime > TIMEOUT_MS) {
       throw Object.assign(new Error('Agent timed out after 15 minutes'), { code: 'TIMEOUT' })
     }
+
+    // Compress context if approaching 40% of the context window
+    messages = maybeCompress(messages)
 
     const response = await claude().beta.messages.create({
       model: MODEL,
@@ -205,8 +267,13 @@ async function runAgent(jobId) {
 
   await db.query(`UPDATE jobs SET status = 'processing' WHERE id = $1`, [jobId])
 
+  // Track per-user concurrent slot. Decremented in finally — cancelled jobs skip
+  // the decrement because the cancel handler already called decrementConcurrent.
+  await incrementConcurrent(job.user_id).catch(() => {})
+
   let lastError = null
 
+  try {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let vmIp = null
     const startTime = Date.now()
@@ -222,27 +289,32 @@ async function runAgent(jobId) {
       await tearDownVm(jobId)
       vmIp = null
 
-      // Create DocuSign draft (implemented in next step; lazy-require to avoid circular dep)
-      try {
-        const { createDraftEnvelope } = require('./docusign')
-        await createDraftEnvelope(jobId, pdfBuffer)
-      } catch (dsErr) {
-        console.error(`[agent] DocuSign draft failed for job ${jobId}:`, dsErr.message)
-        // createDraftEnvelope handles its own fallback (save PDF to GCS, retry)
-      }
+      // Upload estimate PDF to GCS and register it as a file record
+      const estimateFileId = uuidv4()
+      const estimateGcsKey = `jobs/${jobId}/estimate.pdf`
+      await uploadFile(pdfBuffer, estimateGcsKey, 'application/pdf')
+      await db.query(
+        `INSERT INTO files (id, job_id, filename, gcs_key, file_type, size_bytes, malware_clean)
+         VALUES ($1, $2, 'estimate.pdf', $3, 'application/pdf', $4, true)`,
+        [estimateFileId, jobId, estimateGcsKey, pdfBuffer.length]
+      )
+      await db.query(
+        `UPDATE jobs SET status = 'review_ready', estimate_file_id = $1 WHERE id = $2`,
+        [estimateFileId, jobId]
+      )
 
-      // Notify user
+      // Notify user with a direct link to the job page
       try {
         const { sendJobReadyEmail } = require('./email')
         const { rows: [user] } = await db.query(
           'SELECT email FROM users WHERE id = $1', [job.user_id]
         )
-        if (user?.email) await sendJobReadyEmail(user.email, jobId)
+        const jobUrl = `${process.env.CLIENT_URL || 'http://localhost:5173'}/jobs/${jobId}`
+        if (user?.email) await sendJobReadyEmail(user.email, jobId, job.address, jobUrl)
       } catch (e) {
         console.error('[agent] ready email failed:', e.message)
       }
 
-      await db.query(`UPDATE jobs SET status = 'review_ready' WHERE id = $1`, [jobId])
       return  // success
 
     } catch (err) {
@@ -271,8 +343,10 @@ async function runAgent(jobId) {
 
   // Both attempts failed
   const errMsg = lastError?.message || 'Agent failed after 2 attempts'
+  // Guard: don't overwrite 'cancelled' status if the job was cancelled mid-processing
   await db.query(
-    `UPDATE jobs SET status = 'failed', error_message = $1 WHERE id = $2`,
+    `UPDATE jobs SET status = 'failed', error_message = $1
+     WHERE id = $2 AND status != 'cancelled'`,
     [errMsg, jobId]
   )
 
@@ -284,6 +358,17 @@ async function runAgent(jobId) {
     if (user?.email) await sendJobFailedEmail(user.email, jobId, errMsg)
   } catch (e) {
     console.error('[agent] failure email failed:', e.message)
+  }
+
+  } finally {
+    // Decrement per-user concurrent slot unless the job was cancelled
+    // (cancel handler already decremented to avoid double-decrement)
+    const { rows: [cur] } = await db.query(
+      'SELECT status FROM jobs WHERE id = $1', [jobId]
+    ).catch(() => ({ rows: [] }))
+    if (cur?.status !== 'cancelled') {
+      await decrementConcurrent(job.user_id).catch(() => {})
+    }
   }
 }
 
